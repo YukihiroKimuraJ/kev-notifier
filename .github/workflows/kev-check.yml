@@ -1,0 +1,42 @@
+name: KEV check
+
+on:
+  schedule:
+    # 6時間おき（KEVの更新は概ね週2回なので十分な頻度）。
+    # 毎時0分はGitHub側が混むので23分にずらしている。
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kev-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Fetch KEV and notify Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: go run .
+
+      - name: Commit updated state
+        run: |
+          git add state/seen_cves.json
+          if git diff --cached --quiet; then
+            echo "state unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: update KEV state ($(date -u +%Y-%m-%dT%H:%M%z))"
+          git push

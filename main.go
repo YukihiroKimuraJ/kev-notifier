@@ -15,13 +15,26 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strings"
 	"time"
 )
 
-const defaultCatalogURL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+const (
+	defaultCatalogURL     = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+	maxCatalogBytes       = 16 << 20
+	maxCatalogEntries     = 10_000
+	maxCatalogFieldRunes  = 4_000
+	maxCatalogRemovals    = 25
+	maxCatalogShrinkPct   = 5
+	maxNewVulnerabilities = 100
+)
+
+var cveIDPattern = regexp.MustCompile(`^CVE-[0-9]{4}-[0-9]{4,}$`)
 
 // maxVulnsPerMessage keeps each Slack message under the 50-blocks API limit
 // (1 header block + 2 blocks per CVE).
@@ -102,6 +115,10 @@ func run(ctx context.Context, catalogURL, statePath, webhookURL string, dryRun b
 		return nil
 	}
 
+	if err := validateCatalogAgainstState(catalog, seen); err != nil {
+		return fmt.Errorf("validate catalog: %w", err)
+	}
+
 	newVulns := diffNew(catalog, seen)
 	if len(newVulns) == 0 {
 		log.Print("no new KEV entries")
@@ -153,14 +170,83 @@ func fetchCatalog(ctx context.Context, url string) (*Catalog, error) {
 		return nil, fmt.Errorf("unexpected status %s: %s", resp.Status, body)
 	}
 
-	var catalog Catalog
-	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+	limited := &io.LimitedReader{R: resp.Body, N: maxCatalogBytes + 1}
+	body, err := io.ReadAll(limited)
+	if err != nil {
 		return nil, err
 	}
-	if len(catalog.Vulnerabilities) == 0 {
-		return nil, fmt.Errorf("catalog contains no vulnerabilities; refusing to proceed")
+	if len(body) > maxCatalogBytes {
+		return nil, fmt.Errorf("catalog exceeds %d-byte limit", maxCatalogBytes)
+	}
+
+	var catalog Catalog
+	if err := json.Unmarshal(body, &catalog); err != nil {
+		return nil, err
+	}
+	if err := validateCatalog(&catalog); err != nil {
+		return nil, err
 	}
 	return &catalog, nil
+}
+
+func validateCatalog(catalog *Catalog) error {
+	count := len(catalog.Vulnerabilities)
+	if count == 0 {
+		return fmt.Errorf("catalog contains no vulnerabilities; refusing to proceed")
+	}
+	if count > maxCatalogEntries {
+		return fmt.Errorf("catalog contains %d vulnerabilities, limit is %d", count, maxCatalogEntries)
+	}
+	if catalog.Count != count {
+		return fmt.Errorf("catalog count %d does not match %d decoded vulnerabilities", catalog.Count, count)
+	}
+	if err := validateCatalogField("catalogVersion", catalog.CatalogVersion); err != nil {
+		return err
+	}
+
+	seen := make(map[string]struct{}, count)
+	for i, v := range catalog.Vulnerabilities {
+		if !cveIDPattern.MatchString(v.CveID) {
+			return fmt.Errorf("vulnerability %d has invalid CVE ID %q", i, v.CveID)
+		}
+		if _, exists := seen[v.CveID]; exists {
+			return fmt.Errorf("catalog contains duplicate CVE ID %s", v.CveID)
+		}
+		seen[v.CveID] = struct{}{}
+		for name, value := range map[string]string{
+			"vendorProject":     v.VendorProject,
+			"product":           v.Product,
+			"vulnerabilityName": v.VulnerabilityName,
+			"shortDescription":  v.ShortDescription,
+			"dueDate":           v.DueDate,
+		} {
+			if err := validateCatalogField(name, value); err != nil {
+				return fmt.Errorf("%s: %w", v.CveID, err)
+			}
+		}
+	}
+	return nil
+}
+
+func validateCatalogField(name, value string) error {
+	if len([]rune(value)) > maxCatalogFieldRunes {
+		return fmt.Errorf("%s exceeds %d-rune limit", name, maxCatalogFieldRunes)
+	}
+	return nil
+}
+
+func validateCatalogAgainstState(catalog *Catalog, seen map[string]bool) error {
+	if len(seen) > 0 && len(catalog.Vulnerabilities) < len(seen) {
+		removed := len(seen) - len(catalog.Vulnerabilities)
+		if removed > maxCatalogRemovals && removed*100 > len(seen)*maxCatalogShrinkPct {
+			return fmt.Errorf("catalog shrank from %d to %d entries; preserving last-known-good state", len(seen), len(catalog.Vulnerabilities))
+		}
+	}
+	newCount := len(diffNew(catalog, seen))
+	if newCount > maxNewVulnerabilities {
+		return fmt.Errorf("catalog contains %d new vulnerabilities, per-run limit is %d", newCount, maxNewVulnerabilities)
+	}
+	return nil
 }
 
 func loadSeen(path string) (seen map[string]bool, exists bool, err error) {
@@ -231,7 +317,7 @@ func buildMessages(vulns []Vulnerability, catalog *Catalog) []slackMessage {
 			blocks = append(blocks,
 				map[string]any{
 					"type": "section",
-					"text": map[string]any{"type": "mrkdwn", "text": formatVuln(v)},
+					"text": map[string]any{"type": "plain_text", "text": formatVuln(v), "emoji": true},
 				},
 				map[string]any{"type": "divider"},
 			)
@@ -241,7 +327,7 @@ func buildMessages(vulns []Vulnerability, catalog *Catalog) []slackMessage {
 			"elements": []map[string]any{
 				{
 					"type": "mrkdwn",
-					"text": fmt.Sprintf("KEV catalog %s ・ <https://www.cisa.gov/known-exploited-vulnerabilities-catalog|カタログを見る>", catalog.CatalogVersion),
+					"text": fmt.Sprintf("KEV catalog %s ・ <https://www.cisa.gov/known-exploited-vulnerabilities-catalog|カタログを見る>", escapeSlackText(catalog.CatalogVersion)),
 				},
 			},
 		})
@@ -257,15 +343,20 @@ func buildMessages(vulns []Vulnerability, catalog *Catalog) []slackMessage {
 func formatVuln(v Vulnerability) string {
 	ransomware := "Unknown"
 	if v.KnownRansomwareCampaignUse == "Known" {
-		ransomware = "⚠️ *Known*"
+		ransomware = "⚠️ Known"
 	}
 	return fmt.Sprintf(
-		"*<https://nvd.nist.gov/vuln/detail/%s|%s>* — %s %s\n%s\n> %s\n対応期限: *%s* ・ ランサムウェアでの悪用: %s",
-		v.CveID, v.CveID, v.VendorProject, v.Product,
+		"%s — %s %s\n%s\n%s\n対応期限: %s ・ ランサムウェアでの悪用: %s\nNVD: https://nvd.nist.gov/vuln/detail/%s",
+		v.CveID, v.VendorProject, v.Product,
 		v.VulnerabilityName,
 		truncate(v.ShortDescription, 280),
-		v.DueDate, ransomware,
+		v.DueDate, ransomware, url.PathEscape(v.CveID),
 	)
+}
+
+func escapeSlackText(s string) string {
+	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+	return replacer.Replace(s)
 }
 
 // truncate shortens s to at most n runes, appending an ellipsis when cut.

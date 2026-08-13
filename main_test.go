@@ -108,8 +108,99 @@ func TestFormatVulnRansomwareFlag(t *testing.T) {
 		t.Fatalf("unexpected ransomware warning for Unknown: %s", got)
 	}
 	v.KnownRansomwareCampaignUse = "Known"
-	if got := formatVuln(v); !strings.Contains(got, "⚠️ *Known*") {
+	if got := formatVuln(v); !strings.Contains(got, "⚠️ Known") {
 		t.Fatalf("missing ransomware warning for Known: %s", got)
+	}
+}
+
+func TestBuildMessagesRendersCatalogTextAsPlainText(t *testing.T) {
+	v := makeCatalog("CVE-2026-0001").Vulnerabilities[0]
+	v.VendorProject = "<!channel> & <https://evil.example|click>"
+	v.VulnerabilityName = "name > trusted"
+	v.ShortDescription = "description & more"
+
+	catalog := makeCatalog("CVE-2026-0001")
+	catalog.Vulnerabilities[0] = v
+	catalog.CatalogVersion = "<!channel>"
+	message := buildMessages(catalog.Vulnerabilities, catalog)[0]
+	text, ok := message.Blocks[1]["text"].(map[string]any)
+	if !ok {
+		t.Fatalf("section text = %#v, want text object", message.Blocks[1]["text"])
+	}
+	if got := text["type"]; got != "plain_text" {
+		t.Fatalf("catalog section type = %v, want plain_text", got)
+	}
+	if got := text["text"].(string); !strings.Contains(got, "<!channel>") {
+		t.Fatalf("plain-text section did not preserve legitimate catalog content: %q", got)
+	}
+	contextBlock := message.Blocks[len(message.Blocks)-1]
+	elements := contextBlock["elements"].([]map[string]any)
+	contextText := elements[0]["text"].(string)
+	if strings.Contains(contextText, "<!channel>") || !strings.Contains(contextText, "&lt;!channel&gt;") {
+		t.Fatalf("catalog version was not escaped in mrkdwn context: %q", contextText)
+	}
+}
+
+func TestValidateCatalogRejectsInvalidStructure(t *testing.T) {
+	tests := []struct {
+		name    string
+		catalog *Catalog
+		want    string
+	}{
+		{name: "count mismatch", catalog: &Catalog{Count: 2, Vulnerabilities: makeCatalog("CVE-2026-0001").Vulnerabilities}, want: "does not match"},
+		{name: "duplicate", catalog: makeCatalog("CVE-2026-0001", "CVE-2026-0001"), want: "duplicate"},
+		{name: "malformed ID", catalog: makeCatalog("not-a-cve"), want: "invalid CVE ID"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateCatalog(tt.catalog); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("validateCatalog() error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateCatalogAgainstStatePreservesLastKnownGood(t *testing.T) {
+	seen := make(map[string]bool, 100)
+	ids := make([]string, 100)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("CVE-2026-%04d", i+1)
+		seen[ids[i]] = true
+	}
+	if err := validateCatalogAgainstState(makeCatalog("CVE-2026-0001"), seen); err == nil || !strings.Contains(err.Error(), "shrank") {
+		t.Fatalf("validateCatalogAgainstState() error = %v, want shrink rejection", err)
+	}
+
+	newIDs := make([]string, maxNewVulnerabilities+1)
+	for i := range newIDs {
+		newIDs[i] = fmt.Sprintf("CVE-2027-%04d", i+1000)
+	}
+	combined := append(append([]string{}, ids...), newIDs...)
+	if err := validateCatalogAgainstState(makeCatalog(combined...), seen); err == nil || !strings.Contains(err.Error(), "per-run limit") {
+		t.Fatalf("validateCatalogAgainstState() error = %v, want notification-limit rejection", err)
+	}
+
+	legitimateRemoval := makeCatalog(ids[:99]...)
+	if err := validateCatalogAgainstState(legitimateRemoval, seen); err != nil {
+		t.Fatalf("validateCatalogAgainstState() rejected legitimate removal: %v", err)
+	}
+
+	legitimateAddition := makeCatalog(append(ids, "CVE-2027-0001")...)
+	if err := validateCatalogAgainstState(legitimateAddition, seen); err != nil {
+		t.Fatalf("validateCatalogAgainstState() rejected legitimate addition: %v", err)
+	}
+}
+
+func TestFetchCatalogRejectsOversizedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(strings.Repeat("x", maxCatalogBytes+1)))
+	}))
+	defer server.Close()
+
+	_, err := fetchCatalog(context.Background(), server.URL)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("fetchCatalog() error = %v, want size-limit rejection", err)
 	}
 }
 
@@ -156,6 +247,7 @@ func TestRunEndToEnd(t *testing.T) {
 	// Second run with one added CVE: exactly one notification.
 	catalog.Vulnerabilities = append(catalog.Vulnerabilities,
 		Vulnerability{CveID: "CVE-2026-0003", VendorProject: "V", Product: "P"})
+	catalog.Count = len(catalog.Vulnerabilities)
 	if err := run(ctx, cisa.URL, statePath, slack.URL, false); err != nil {
 		t.Fatal(err)
 	}
@@ -201,6 +293,7 @@ func TestRunDryRunNeverWritesState(t *testing.T) {
 	before, _ := os.ReadFile(statePath)
 	catalog.Vulnerabilities = append(catalog.Vulnerabilities,
 		Vulnerability{CveID: "CVE-2026-0002", VendorProject: "V", Product: "P"})
+	catalog.Count = len(catalog.Vulnerabilities)
 	if err := run(ctx, cisa.URL, statePath, "", true); err != nil {
 		t.Fatal(err)
 	}
@@ -237,6 +330,7 @@ func TestRunKeepsStateOnSlackFailure(t *testing.T) {
 
 	catalog.Vulnerabilities = append(catalog.Vulnerabilities,
 		Vulnerability{CveID: "CVE-2026-0002", VendorProject: "V", Product: "P"})
+	catalog.Count = len(catalog.Vulnerabilities)
 	if err := run(ctx, cisa.URL, statePath, slack.URL, false); err == nil {
 		t.Fatal("run succeeded despite Slack failure, want error")
 	}
@@ -247,5 +341,48 @@ func TestRunKeepsStateOnSlackFailure(t *testing.T) {
 	}
 	if string(before) != string(after) {
 		t.Fatal("state was updated even though the Slack post failed")
+	}
+}
+
+func TestRunRejectsPartialCatalogWithoutChangingState(t *testing.T) {
+	ids := make([]string, 100)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("CVE-2026-%04d", i+1)
+	}
+	catalog := makeCatalog(ids...)
+	cisa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(catalog)
+	}))
+	defer cisa.Close()
+
+	posts := 0
+	slack := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts++
+	}))
+	defer slack.Close()
+
+	statePath := filepath.Join(t.TempDir(), "seen.json")
+	ctx := context.Background()
+	if err := run(ctx, cisa.URL, statePath, slack.URL, false); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	catalog = makeCatalog("CVE-2026-0001")
+	if err := run(ctx, cisa.URL, statePath, slack.URL, false); err == nil || !strings.Contains(err.Error(), "shrank") {
+		t.Fatalf("run() error = %v, want partial-catalog rejection", err)
+	}
+	after, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("partial catalog changed the last-known-good state")
+	}
+	if posts != 0 {
+		t.Fatalf("partial catalog posted %d Slack messages, want 0", posts)
 	}
 }
